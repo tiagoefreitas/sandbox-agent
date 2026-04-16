@@ -139,6 +139,7 @@ export interface SessionRecord {
   id: string;
   agent: string;
   agentSessionId: string;
+  serverId?: string;
   lastConnectionId: string;
   createdAt: number;
   destroyedAt?: number;

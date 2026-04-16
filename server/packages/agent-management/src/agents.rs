@@ -1127,9 +1127,9 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
     let mut patched = source.to_string();
 
     if !patched.contains(r#"CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1""#) {
-        let needle = "                ...createEnvForGateway(this.gatewayAuthMeta),\n";
+        let needle = "...createEnvForGateway(this.gatewayAuthMeta),";
         let replacement = concat!(
-            "                ...createEnvForGateway(this.gatewayAuthMeta),\n",
+            "...createEnvForGateway(this.gatewayAuthMeta),\n",
             "                CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: \"1\",\n"
         );
 
@@ -1143,7 +1143,7 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
     }
 
     if !patched.contains(r#"case "session_state_changed":"#) {
-        let hook_case = r#"                            case "hook_started":"#;
+        let hook_case = r#"case "hook_started":"#;
         let session_state_block = concat!(
             "                            case \"session_state_changed\": {\n",
             "                                if (message.state === \"idle\") {\n",
@@ -1171,8 +1171,8 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
         patched = patched.replacen(hook_case, &format!("{session_state_block}{hook_case}"), 1);
     }
 
-    if !patched.contains(r#"sessionUpdate: "background_event""#) {
-        let hook_block_start = patched.find(r#"                            case "hook_started":"#)
+    if !patched.contains(r#"extNotification("_adapter/background_event""#) {
+        let hook_block_start = patched.find(r#"case "hook_started":"#)
             .ok_or_else(|| {
                 AgentError::ExtractFailed(
                     "unsupported Claude ACP adapter layout: missing background event cases"
@@ -1191,7 +1191,7 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
         let todo_comment_start = hook_block_start + todo_comment_rel;
 
         let break_rel = patched[todo_comment_start..]
-            .find("                                break;")
+            .find("break;")
             .ok_or_else(|| {
                 AgentError::ExtractFailed(
                     "unsupported Claude ACP adapter layout: missing background event break"
@@ -1214,18 +1214,136 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
             "                            case \"task_progress\":\n",
             "                            case \"elicitation_complete\":\n",
             "                            case \"api_retry\":\n",
-            "                                await this.client.sessionUpdate({\n",
+            "                                await this.client.extNotification(\"_adapter/background_event\", {\n",
             "                                    sessionId: message.session_id ?? params.sessionId,\n",
-            "                                    update: {\n",
-            "                                        sessionUpdate: \"background_event\",\n",
-            "                                        eventType: message.subtype,\n",
-            "                                        data: message,\n",
-            "                                    },\n",
+            "                                    eventType: message.subtype,\n",
+            "                                    data: message,\n",
             "                                });\n",
             "                                break;\n"
         );
 
         patched.replace_range(hook_block_start..break_end, replacement);
+    }
+
+    if !patched.contains(r#"message.message.stop_reason === "end_turn""#) {
+        let content_block_start = patched
+            .find(r#"const content = message.type === "assistant""#)
+            .ok_or_else(|| {
+                AgentError::ExtractFailed(
+                    "unsupported Claude ACP adapter layout: missing assistant completion block"
+                        .to_string(),
+                )
+            })?;
+        let break_rel = patched[content_block_start..]
+            .find("break;")
+            .ok_or_else(|| {
+                AgentError::ExtractFailed(
+                    "unsupported Claude ACP adapter layout: missing assistant completion break"
+                        .to_string(),
+                )
+            })?;
+        let break_start = content_block_start + break_rel;
+        let insertion = concat!(
+            "if (message.type === \"assistant\" &&\n",
+            "                            message.parent_tool_use_id === null &&\n",
+            "                            message.message.stop_reason === \"end_turn\") {\n",
+            "                            return { stopReason: \"end_turn\", usage: sessionUsage(session) };\n",
+            "                        }\n",
+            "                        "
+        );
+
+        if !patched[content_block_start..break_start].contains(
+            r#"message.message.stop_reason === "end_turn""#,
+        ) {
+            patched.insert_str(break_start, insertion);
+        } else {
+            return Err(AgentError::ExtractFailed(
+                "unsupported Claude ACP adapter layout: assistant completion block already patched"
+                    .to_string(),
+            ));
+        }
+    }
+
+    if !patched.contains(r#"extNotification("_adapter/resumed_end_turn""#) {
+        let resume_needle = concat!(
+            "async unstable_resumeSession(params) {\n",
+            "    const result = await this.getOrCreateSession(params);\n"
+        );
+        let resume_replacement = concat!(
+            "async unstable_resumeSession(params) {\n",
+            "    const result = await this.getOrCreateSession(params);\n",
+            "        await this.emitResumedEndTurnIfComplete(params.sessionId);\n"
+        );
+
+        if !patched.contains(resume_needle) {
+            return Err(AgentError::ExtractFailed(
+                "unsupported Claude ACP adapter layout: missing resume session block"
+                    .to_string(),
+            ));
+        }
+
+        patched = patched.replacen(resume_needle, resume_replacement, 1);
+
+        let replay_history_needle = concat!("async replaySessionHistory(sessionId) {\n", "    const toolUseCache = {};\n");
+        let replay_history_replacement = concat!(
+            "async emitResumedEndTurnIfComplete(sessionId) {\n",
+            "    const messages = await getSessionMessages(sessionId);\n",
+            "    for (let i = messages.length - 1; i >= 0; i--) {\n",
+            "        const message = messages[i];\n",
+            "        if (message.type !== \"assistant\" || message.parent_tool_use_id !== null) {\n",
+            "            continue;\n",
+            "        }\n",
+            "        if (message.message.stop_reason !== \"end_turn\") {\n",
+            "            return;\n",
+            "        }\n",
+            "        await this.client.extNotification(\"_adapter/resumed_end_turn\", {\n",
+            "            sessionId,\n",
+            "            stopReason: \"end_turn\",\n",
+            "            text: extractTextContent(message.message.content),\n",
+            "        });\n",
+            "        return;\n",
+            "    }\n",
+            "}\n",
+            "async replaySessionHistory(sessionId) {\n",
+            "    const toolUseCache = {};\n"
+        );
+
+        if !patched.contains(replay_history_needle) {
+            return Err(AgentError::ExtractFailed(
+                "unsupported Claude ACP adapter layout: missing replay history block"
+                    .to_string(),
+            ));
+        }
+
+        patched = patched.replacen(replay_history_needle, replay_history_replacement, 1);
+
+        let helper_needle = concat!("function sessionUsage(session) {\n", "    return {\n");
+        let helper_replacement = concat!(
+            "function extractTextContent(content) {\n",
+            "    if (typeof content === \"string\") {\n",
+            "        return content;\n",
+            "    }\n",
+            "    if (!Array.isArray(content)) {\n",
+            "        return \"\";\n",
+            "    }\n",
+            "    return content\n",
+            "        .filter((item) => item?.type === \"text\" && typeof item.text === \"string\")\n",
+            "        .map((item) => item.text)\n",
+            "        .join(\"\\n\")\n",
+            "        .trim();\n",
+            "}\n",
+            "function sessionUsage(session) {\n",
+            "    return {\n"
+        );
+
+        if !patched.contains(helper_needle) {
+            return Err(AgentError::ExtractFailed(
+                "unsupported Claude ACP adapter layout: missing session usage helper"
+                    .to_string(),
+            ));
+        }
+
+        patched = patched.replacen(helper_needle, helper_replacement, 1);
     }
 
     Ok(patched)
@@ -1858,6 +1976,15 @@ done
 mkdir -p "$prefix/node_modules/.bin"
 mkdir -p "$prefix/node_modules/@zed-industries/claude-agent-acp/dist"
 cat > "$prefix/node_modules/@zed-industries/claude-agent-acp/dist/acp-agent.js" <<'EOF'
+async unstable_resumeSession(params) {
+    const result = await this.getOrCreateSession(params);
+    return result;
+}
+
+async replaySessionHistory(sessionId) {
+    const toolUseCache = {};
+}
+
 const options = {
     env: {
         ...process.env,
@@ -1877,6 +2004,31 @@ switch (message.subtype) {
     case "elicitation_complete":
         // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
         break;
+}
+
+const content = message.type === "assistant"
+    ? message.message.content.filter((item) => !["text", "thinking"].includes(item.type))
+    : message.message.content;
+for (const notification of toAcpNotifications(content, message.message.role, params.sessionId, this.toolUseCache, this.client, this.logger, {
+    clientCapabilities: this.clientCapabilities,
+    parentToolUseId: message.parent_tool_use_id,
+    cwd: session.cwd,
+})) {
+    await this.client.sessionUpdate(notification);
+}
+break;
+
+function sessionUsage(session) {
+    return {
+        inputTokens: session.accumulatedUsage.inputTokens,
+        outputTokens: session.accumulatedUsage.outputTokens,
+        cachedReadTokens: session.accumulatedUsage.cachedReadTokens,
+        cachedWriteTokens: session.accumulatedUsage.cachedWriteTokens,
+        totalTokens: session.accumulatedUsage.inputTokens +
+            session.accumulatedUsage.outputTokens +
+            session.accumulatedUsage.cachedReadTokens +
+            session.accumulatedUsage.cachedWriteTokens,
+    };
 }
 EOF
 cat > "$prefix/node_modules/@zed-industries/claude-agent-acp/package.json" <<'EOF'
@@ -2137,12 +2289,28 @@ exit 0
             "patched adapter should handle idle session state transitions"
         );
         assert!(
-            patched.contains(r#"sessionUpdate: "background_event""#),
-            "patched adapter should forward background task notifications"
+            patched.contains(r#"extNotification("_adapter/background_event""#),
+            "patched adapter should forward background task notifications as extension notifications"
         );
         assert!(
             patched.contains(r#"eventType: message.subtype"#),
             "patched adapter should include the Claude event subtype"
+        );
+        assert!(
+            patched.contains(r#"sessionId: message.session_id ?? params.sessionId"#),
+            "patched adapter should preserve the session id on background task notifications"
+        );
+        assert!(
+            patched.contains(r#"message.message.stop_reason === "end_turn""#),
+            "patched adapter should terminate turns when Claude emits end_turn on assistant messages"
+        );
+        assert!(
+            patched.contains(r#"extNotification("_adapter/resumed_end_turn""#),
+            "patched adapter should emit a resume completion notification when a resumed turn already ended"
+        );
+        assert!(
+            patched.contains(r#"await this.emitResumedEndTurnIfComplete(params.sessionId);"#),
+            "patched adapter should check for completed turns during session resume"
         );
     }
 

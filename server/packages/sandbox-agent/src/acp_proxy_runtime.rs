@@ -14,7 +14,7 @@ use sandbox_agent_opencode_adapter::{AcpDispatch, AcpDispatchResult, AcpPayloadS
 use serde_json::{Number, Value};
 use tokio::sync::{Mutex, RwLock};
 
-const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 7_200_000;
 
 #[derive(Debug, Clone)]
 pub struct AcpProxyRuntime {
