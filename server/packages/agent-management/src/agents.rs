@@ -1172,13 +1172,11 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
     }
 
     if !patched.contains(r#"extNotification("_adapter/background_event""#) {
-        let hook_block_start = patched.find(r#"case "hook_started":"#)
-            .ok_or_else(|| {
-                AgentError::ExtractFailed(
-                    "unsupported Claude ACP adapter layout: missing background event cases"
-                        .to_string(),
-                )
-            })?;
+        let hook_block_start = patched.find(r#"case "hook_started":"#).ok_or_else(|| {
+            AgentError::ExtractFailed(
+                "unsupported Claude ACP adapter layout: missing background event cases".to_string(),
+            )
+        })?;
 
         let todo_comment_rel = patched[hook_block_start..]
             .find("// Todo: process via status api:")
@@ -1252,9 +1250,9 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
             "                        "
         );
 
-        if !patched[content_block_start..break_start].contains(
-            r#"message.message.stop_reason === "end_turn""#,
-        ) {
+        if !patched[content_block_start..break_start]
+            .contains(r#"message.message.stop_reason === "end_turn""#)
+        {
             patched.insert_str(break_start, insertion);
         } else {
             return Err(AgentError::ExtractFailed(
@@ -1264,17 +1262,89 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
         }
     }
 
-    // Note: We intentionally do NOT patch the in-loop `stop_reason: null`
-    // handler here. Claude sometimes emits mid-turn "narrative" top-level
-    // assistant messages with text content and stop_reason:null before
-    // continuing with more tool calls. Finalizing on the first such message
-    // would truncate the turn. Instead, the caller (Sherlock) detects the
-    // rare "Claude never finalizes" case by inspecting the JSONL transcript
-    // after TRANSCRIPT_IDLE_FINALIZE_MS of quiet time, which cannot misfire
-    // on mid-turn narrative messages because Claude continues writing to the
-    // transcript. The resume-time `emitResumedEndTurnIfComplete` fallback
-    // below is still safe because by the time we're resuming, the session is
-    // definitely not actively streaming.
+    // Amplemarket patch: idle-timeout escape hatch for the prompt handler's
+    // while-loop. Claude CLI occasionally emits the final top-level assistant
+    // message with stop_reason:null and then stops producing messages;
+    // session.query.next() otherwise awaits forever. We wrap it in
+    // Promise.race with a stream-idle timer. When the timer fires we re-check
+    // the JSONL transcript through the same helper used by
+    // emitResumedEndTurnIfComplete — but only after the JSONL file itself has
+    // also been idle for a while, so mid-turn narrative pauses (during which
+    // Claude or a subagent is still writing progress/tool entries to JSONL)
+    // cannot trip the check. If both gates pass and the tail top-level
+    // assistant has non-empty text content, return end_turn through the
+    // normal ACP response path — no out-of-band channel, no client-side
+    // JSONL peeking.
+    if !patched.contains("AMPLEMARKET_IDLE_SENTINEL") {
+        let needle = concat!(
+            "session.promptRunning = true;\n",
+            "        let handedOff = false;\n",
+            "        try {\n",
+            "            while (true) {\n",
+            "                const { value: message, done } = await session.query.next();\n",
+        );
+        let replacement = concat!(
+            "session.promptRunning = true;\n",
+            "        let handedOff = false;\n",
+            "        const AMPLEMARKET_IDLE_CHECK_MS = 300000;\n",
+            "        const AMPLEMARKET_JSONL_IDLE_MS = 240000;\n",
+            "        const AMPLEMARKET_IDLE_SENTINEL = Symbol.for(\"amplemarket-acp-idle\");\n",
+            "        let pendingNextPromise = null;\n",
+            "        const resolveJsonlPath = () => {\n",
+            "            try {\n",
+            "                const p = require(\"node:path\");\n",
+            "                const o = require(\"node:os\");\n",
+            "                const cwd = session && session.cwd ? session.cwd : process.cwd();\n",
+            "                const slug = cwd.replace(/[\\\\/]/g, \"-\");\n",
+            "                return p.join(o.homedir(), \".claude\", \"projects\", slug, `${params.sessionId}.jsonl`);\n",
+            "            } catch { return null; }\n",
+            "        };\n",
+            "        const amplemarketCheckJsonlForAbandonedEndTurn = async () => {\n",
+            "            try {\n",
+            "                const fsMod = require(\"node:fs\");\n",
+            "                const jsonlPath = resolveJsonlPath();\n",
+            "                if (jsonlPath) {\n",
+            "                    try {\n",
+            "                        const st = fsMod.statSync(jsonlPath);\n",
+            "                        if (Date.now() - st.mtimeMs < AMPLEMARKET_JSONL_IDLE_MS) return null;\n",
+            "                    } catch { return null; }\n",
+            "                }\n",
+            "                const msgs = await getSessionMessages(params.sessionId);\n",
+            "                for (let i = msgs.length - 1; i >= 0; i--) {\n",
+            "                    const m = msgs[i];\n",
+            "                    if (!m || m.type !== \"assistant\" || m.parent_tool_use_id !== null) continue;\n",
+            "                    const c = m.message && m.message.content;\n",
+            "                    const hasText = Array.isArray(c) && c.some((it) => it && it.type === \"text\" && typeof it.text === \"string\" && it.text.trim().length > 0);\n",
+            "                    if (!hasText) return null;\n",
+            "                    const s = m.message.stop_reason;\n",
+            "                    if (s === \"end_turn\" || s === null) return m;\n",
+            "                    return null;\n",
+            "                }\n",
+            "                return null;\n",
+            "            } catch { return null; }\n",
+            "        };\n",
+            "        try {\n",
+            "            while (true) {\n",
+            "                if (!pendingNextPromise) { pendingNextPromise = session.query.next(); }\n",
+            "                const timerPromise = new Promise((resolve) => { setTimeout(() => resolve(AMPLEMARKET_IDLE_SENTINEL), AMPLEMARKET_IDLE_CHECK_MS); });\n",
+            "                const race = await Promise.race([pendingNextPromise, timerPromise]);\n",
+            "                if (race === AMPLEMARKET_IDLE_SENTINEL) {\n",
+            "                    const finalA = await amplemarketCheckJsonlForAbandonedEndTurn();\n",
+            "                    if (finalA) { return { stopReason: \"end_turn\", usage: sessionUsage(session) }; }\n",
+            "                    continue;\n",
+            "                }\n",
+            "                const { value: message, done } = race;\n",
+            "                pendingNextPromise = null;\n",
+        );
+
+        if !patched.contains(needle) {
+            return Err(AgentError::ExtractFailed(
+                "unsupported Claude ACP adapter layout: missing prompt while-loop anchor for idle-timeout patch".to_string(),
+            ));
+        }
+
+        patched = patched.replacen(needle, replacement, 1);
+    }
 
     if !patched.contains(r#"extNotification("_adapter/resumed_end_turn""#) {
         let resume_needle = concat!(
@@ -1289,14 +1359,16 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
 
         if !patched.contains(resume_needle) {
             return Err(AgentError::ExtractFailed(
-                "unsupported Claude ACP adapter layout: missing resume session block"
-                    .to_string(),
+                "unsupported Claude ACP adapter layout: missing resume session block".to_string(),
             ));
         }
 
         patched = patched.replacen(resume_needle, resume_replacement, 1);
 
-        let replay_history_needle = concat!("async replaySessionHistory(sessionId) {\n", "    const toolUseCache = {};\n");
+        let replay_history_needle = concat!(
+            "async replaySessionHistory(sessionId) {\n",
+            "    const toolUseCache = {};\n"
+        );
         let replay_history_replacement = concat!(
             "async emitResumedEndTurnIfComplete(sessionId) {\n",
             "    const messages = await getSessionMessages(sessionId);\n",
@@ -1330,8 +1402,7 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
 
         if !patched.contains(replay_history_needle) {
             return Err(AgentError::ExtractFailed(
-                "unsupported Claude ACP adapter layout: missing replay history block"
-                    .to_string(),
+                "unsupported Claude ACP adapter layout: missing replay history block".to_string(),
             ));
         }
 
@@ -1358,8 +1429,7 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
 
         if !patched.contains(helper_needle) {
             return Err(AgentError::ExtractFailed(
-                "unsupported Claude ACP adapter layout: missing session usage helper"
-                    .to_string(),
+                "unsupported Claude ACP adapter layout: missing session usage helper".to_string(),
             ));
         }
 
@@ -2001,6 +2071,18 @@ async unstable_resumeSession(params) {
     return result;
 }
 
+async prompt(params) {
+    const session = this.sessions[params.sessionId];
+    session.promptRunning = true;
+        let handedOff = false;
+        try {
+            while (true) {
+                const { value: message, done } = await session.query.next();
+                if (done) break;
+            }
+        } finally {}
+}
+
 async replaySessionHistory(sessionId) {
     const toolUseCache = {};
 }
@@ -2331,6 +2413,14 @@ exit 0
         assert!(
             patched.contains(r#"await this.emitResumedEndTurnIfComplete(params.sessionId);"#),
             "patched adapter should check for completed turns during session resume"
+        );
+        assert!(
+            patched.contains("AMPLEMARKET_IDLE_SENTINEL"),
+            "patched adapter should wrap query.next() in Promise.race with idle-timeout JSONL fallback"
+        );
+        assert!(
+            patched.contains("amplemarketCheckJsonlForAbandonedEndTurn"),
+            "patched adapter should consult JSONL on idle timeout"
         );
     }
 

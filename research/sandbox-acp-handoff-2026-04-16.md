@@ -10,6 +10,30 @@ This repo carries the `sandbox-agent` side of the Sherlock + Claude ACP debuggin
 - Claude ACP adapter patch durability
 - resumed completion signaling
 
+## Repos And Branches
+
+Work on these repos / branches:
+
+- primary repo: `amplemarket/sandbox-agent`
+- primary branch: `ample/upstream-claude-acp-fixes`
+- local path: [sandbox-agent](/home/agent/repos/sandbox-agent)
+
+Personal mirror:
+
+- personal repo: `tiagoefreitas/sandbox-agent`
+- personal branch: `ample/upstream-claude-acp-fixes`
+
+Companion Sherlock repo:
+
+- repo: `amplemarket/sherlock`
+- branch: `sandbox`
+- local path: [sherlock](/home/agent/repos/sherlock)
+
+Do not continue from these old mistaken branches:
+
+- `ample/private-release-systemd-plan`
+- `ample/upstream-claude-acp-fixes-main`
+
 ## Findings
 
 1. The 2-hour ACP timeout is necessary but not sufficient.

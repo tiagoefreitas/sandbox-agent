@@ -613,7 +613,10 @@ export class LiveAcpConnection {
     }
   }
 
-  async resumeRemoteSession(agentSessionId: string, sessionInit: Omit<NewSessionRequest, "_meta">): Promise<{
+  async resumeRemoteSession(
+    agentSessionId: string,
+    sessionInit: Omit<NewSessionRequest, "_meta">,
+  ): Promise<{
     configOptions?: SessionConfigOption[] | null;
     modes?: SessionModeState | null;
   }> {
@@ -1230,11 +1233,7 @@ export class SandboxAgent {
         }
 
         const live = await this.getLiveConnection(existing.agent, existing.serverId);
-        const sessionInit = normalizeSessionInit(
-          request.sessionInit ?? existing.sessionInit,
-          request.cwd,
-          this.sandboxProvider?.defaultCwd,
-        );
+        const sessionInit = normalizeSessionInit(request.sessionInit ?? existing.sessionInit, request.cwd, this.sandboxProvider?.defaultCwd);
         session = await this.recreateSessionFromPersistedState(existing, live, sessionInit);
       }
       if (request.mode) {
@@ -1486,11 +1485,59 @@ export class SandboxAgent {
       return this.sendSessionMethodInternal(restored.id, method, params, options, allowManagedCancel);
     }
     await this.persistSessionStateFromMethod(record.id, method, params, response);
+    if (method === "session/prompt") {
+      await this.ensurePromptResponseEventPersisted(record.id, live, response);
+    }
     const refreshed = await this.requireSessionRecord(record.id);
     return {
       session: this.upsertSessionHandle(refreshed),
       response,
     };
+  }
+
+  /**
+   * Long-running POST responses sometimes bypass the ACP transport's envelope
+   * observer (e.g., chunked-body read errors after 30+ minutes, pooled
+   * connection reuse quirks). The response arrives via the Promise, but no
+   * `inbound` envelope event fires, so consumers relying on `onSessionEvent`
+   * never see the terminal `stopReason`. Here we synthesize the missing
+   * response envelope, persist it, and fan it out to listeners — at-least-once
+   * delivery without disturbing the normal path (persistObservedEnvelope
+   * dedupes via its insertEvent ON CONFLICT on id).
+   */
+  private async ensurePromptResponseEventPersisted(localSessionId: string, live: LiveAcpConnection, response: unknown): Promise<void> {
+    const stopReason = (response as { stopReason?: unknown } | null | undefined)?.stopReason;
+    if (typeof stopReason !== "string") return;
+
+    try {
+      const envelope = {
+        id: `promptresp-${localSessionId}-${Date.now()}`,
+        jsonrpc: "2.0",
+        result: response,
+      } as unknown as AnyMessage;
+
+      const event: SessionEvent = {
+        id: randomId(),
+        eventIndex: await this.allocateSessionEventIndex(localSessionId),
+        sessionId: localSessionId,
+        createdAt: nowMs(),
+        connectionId: live.connectionId,
+        sender: "agent",
+        payload: envelope,
+      };
+
+      await this.persist.insertEvent(localSessionId, event);
+
+      const listeners = this.eventListeners.get(localSessionId);
+      if (listeners && listeners.size > 0) {
+        for (const listener of listeners) {
+          listener(event);
+        }
+      }
+    } catch (error) {
+      // At-least-once. If we can't mirror the envelope, the caller still has
+      // the Promise return value; don't fail the whole RPC here.
+    }
   }
 
   private async persistSessionStateFromMethod(sessionId: string, method: string, params: Record<string, unknown>, response: unknown): Promise<void> {
@@ -2813,10 +2860,12 @@ function isMissingRemoteSessionError(error: unknown): boolean {
     }
 
     const message = error.message.toLowerCase();
-    return message.includes("session not found")
-      || message.includes("unknown session")
-      || message.includes("session does not exist")
-      || message.includes("closed session");
+    return (
+      message.includes("session not found") ||
+      message.includes("unknown session") ||
+      message.includes("session does not exist") ||
+      message.includes("closed session")
+    );
   }
 
   if (!(error instanceof Error)) {
@@ -2824,10 +2873,12 @@ function isMissingRemoteSessionError(error: unknown): boolean {
   }
 
   const message = error.message.toLowerCase();
-  return message.includes("session not found")
-    || message.includes("unknown session")
-    || message.includes("session does not exist")
-    || message.includes("closed session");
+  return (
+    message.includes("session not found") ||
+    message.includes("unknown session") ||
+    message.includes("session does not exist") ||
+    message.includes("closed session")
+  );
 }
 
 function isSessionResumeUnavailableError(error: unknown): error is SessionResumeUnavailableError {
