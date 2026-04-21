@@ -1262,6 +1262,51 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
         }
     }
 
+    // Amplemarket patch: return end_turn from the "result" success branch when
+    // the underlying Claude run reported stop_reason:end_turn. Without this,
+    // the adapter only returns from the subsequent `case "assistant"` check —
+    // which means an async background tool whose tool_result arrives AFTER
+    // Claude's first end_turn can cause Claude's SDK to re-enter, emit a
+    // second assistant message (typically a brief "that was a stale query,
+    // already delivered" narrative), then end_turn a second time. The adapter
+    // would only return from that second end_turn, and the client's streamed
+    // text buffer holds the second (wrong) message, so Slack gets the stale
+    // narrative instead of the delivery URL.
+    if !patched.contains("Amplemarket patch: return end_turn from result success") {
+        let needle = concat!(
+            "                                if (isLocalOnlyCommand) {\n",
+            "                                    for (const notification of toAcpNotifications(message.result, \"assistant\", params.sessionId, this.toolUseCache, this.client, this.logger)) {\n",
+            "                                        await this.client.sessionUpdate(notification);\n",
+            "                                    }\n",
+            "                                }\n",
+            "                                break;\n",
+            "                            }\n",
+        );
+        let replacement = concat!(
+            "                                if (isLocalOnlyCommand) {\n",
+            "                                    for (const notification of toAcpNotifications(message.result, \"assistant\", params.sessionId, this.toolUseCache, this.client, this.logger)) {\n",
+            "                                        await this.client.sessionUpdate(notification);\n",
+            "                                    }\n",
+            "                                }\n",
+            "                                // Amplemarket patch: return end_turn from result success\n",
+            "                                // so post-end_turn async tool_results cannot trigger a\n",
+            "                                // second assistant message whose chunks clobber the first.\n",
+            "                                if (message.stop_reason === \"end_turn\" && !isLocalOnlyCommand) {\n",
+            "                                    return { stopReason: \"end_turn\", usage };\n",
+            "                                }\n",
+            "                                break;\n",
+            "                            }\n",
+        );
+
+        if !patched.contains(needle) {
+            return Err(AgentError::ExtractFailed(
+                "unsupported Claude ACP adapter layout: missing result success block to anchor end_turn-from-result patch".to_string(),
+            ));
+        }
+
+        patched = patched.replacen(needle, replacement, 1);
+    }
+
     // Amplemarket patch: idle-timeout escape hatch for the prompt handler's
     // while-loop. Claude CLI occasionally emits the final top-level assistant
     // message with stop_reason:null and then stops producing messages;
@@ -2079,6 +2124,16 @@ async prompt(params) {
             while (true) {
                 const { value: message, done } = await session.query.next();
                 if (done) break;
+                switch (message.subtype) {
+                    case "success": {
+                                if (isLocalOnlyCommand) {
+                                    for (const notification of toAcpNotifications(message.result, "assistant", params.sessionId, this.toolUseCache, this.client, this.logger)) {
+                                        await this.client.sessionUpdate(notification);
+                                    }
+                                }
+                                break;
+                            }
+                }
             }
         } finally {}
 }
@@ -2421,6 +2476,10 @@ exit 0
         assert!(
             patched.contains("amplemarketCheckJsonlForAbandonedEndTurn"),
             "patched adapter should consult JSONL on idle timeout"
+        );
+        assert!(
+            patched.contains("Amplemarket patch: return end_turn from result success"),
+            "patched adapter should return end_turn from the result success branch"
         );
     }
 
