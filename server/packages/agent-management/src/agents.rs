@@ -1264,6 +1264,18 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
         }
     }
 
+    // Note: We intentionally do NOT patch the in-loop `stop_reason: null`
+    // handler here. Claude sometimes emits mid-turn "narrative" top-level
+    // assistant messages with text content and stop_reason:null before
+    // continuing with more tool calls. Finalizing on the first such message
+    // would truncate the turn. Instead, the caller (Sherlock) detects the
+    // rare "Claude never finalizes" case by inspecting the JSONL transcript
+    // after TRANSCRIPT_IDLE_FINALIZE_MS of quiet time, which cannot misfire
+    // on mid-turn narrative messages because Claude continues writing to the
+    // transcript. The resume-time `emitResumedEndTurnIfComplete` fallback
+    // below is still safe because by the time we're resuming, the session is
+    // definitely not actively streaming.
+
     if !patched.contains(r#"extNotification("_adapter/resumed_end_turn""#) {
         let resume_needle = concat!(
             "async unstable_resumeSession(params) {\n",
@@ -1293,7 +1305,15 @@ fn patch_claude_agent_process_source(source: &str) -> Result<String, AgentError>
             "        if (message.type !== \"assistant\" || message.parent_tool_use_id !== null) {\n",
             "            continue;\n",
             "        }\n",
-            "        if (message.message.stop_reason !== \"end_turn\") {\n",
+            "        // Amplemarket patch: also treat top-level assistant with\n",
+            "        // text-only content and stop_reason:null as a completed turn.\n",
+            "        // Require a non-empty text item so mid-turn thinking doesn't match.\n",
+            "        const isTextOnlyNullStop = message.message.stop_reason === null &&\n",
+            "            Array.isArray(message.message.content) &&\n",
+            "            message.message.content.length > 0 &&\n",
+            "            message.message.content.every((item) => item && (item.type === \"text\" || item.type === \"thinking\")) &&\n",
+            "            message.message.content.some((item) => item && item.type === \"text\" && typeof item.text === \"string\" && item.text.trim().length > 0);\n",
+            "        if (message.message.stop_reason !== \"end_turn\" && !isTextOnlyNullStop) {\n",
             "            return;\n",
             "        }\n",
             "        await this.client.extNotification(\"_adapter/resumed_end_turn\", {\n",
